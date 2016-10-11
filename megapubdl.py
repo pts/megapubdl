@@ -34,6 +34,7 @@ import socket
 import struct
 import subprocess
 import sys
+import traceback
 
 
 class RequestError(ValueError):
@@ -347,6 +348,7 @@ def main(argv):
     print get_doc()
     sys.exit(0)
   mega = Mega()
+  had_error = False
   for url in argv[1:]:
     print >>sys.stderr, 'info: Downloading URL: %s' % url
     try:
@@ -362,6 +364,8 @@ def main(argv):
         f.close()
     except (socket.error, IOError, OSError, ValueError):
       traceback.print_exc()
+      had_error = True
+  sys.exit(2 * bool(had_error))
 
 
 if __name__ == '__main__':
