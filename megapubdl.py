@@ -36,6 +36,14 @@ import subprocess
 import sys
 import traceback
 
+# This solves the HTTP connection problem on Ubuntu Lucid (10.04), but openssl
+# there is still too old: openssl: unknown option '-aes-128-ctr'
+#import ssl
+#from functools import partial
+#class fake_ssl:
+#  wrap_socket = partial(ssl.wrap_socket, ssl_version=ssl.PROTOCOL_TLSv1)  # Good.
+#httplib.ssl = fake_ssl
+
 
 class RequestError(ValueError):
   """Error in API request."""
