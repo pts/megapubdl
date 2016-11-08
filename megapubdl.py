@@ -78,6 +78,30 @@ def aes_cbc_decrypt_a32(data, key):
   return str_to_a32(aes_cbc(False, a32_to_str(data), a32_to_str(key)))
 
 
+def check_aes_128_ctr():
+  # Ubuntu Lucid has openssl-0.9.8k (2009-03-15), which doesn't have
+  # -aes-128-ctr.
+  try:
+    p = subprocess.Popen(
+        ('openssl', 'enc', '-d', '-aes-128-ctr', '-nopad', '-K', '0', '-iv', '0'),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+  except OSError:
+    raise RuntimeError('You need the openssl command.')
+  try:
+    data, _ = p.communicate('foo\n')
+  finally:
+    p.stdin.close()
+    exitcode = p.wait()
+  if exitcode:
+    raise ValueError(
+        'Error running `openssl enc -aes-128-ctr\' -- '
+        'you may need to upgrade your openssl command.')
+  if data != '\x00\x86\x24\xde':
+    raise ValueError(
+        'Incorrect result from \`openssl enc -aes-128-ctr\' -- '
+        'you may need to reinstall your openssl command.')
+
+
 def stringhash(str, aeskey):
   s32 = str_to_a32(str)
   h32 = [0, 0, 0, 0]
@@ -356,6 +380,7 @@ def main(argv):
   if len(argv) < 2 or argv[1] == '--help':
     print get_doc()
     sys.exit(0)
+  check_aes_128_ctr()
   if (not os.environ.get('PYTHONHTTPSVERIFY', '') and
       getattr(ssl, '_create_unverified_context', None)):
     # Prevent staticpython from trying to load /usr/local/ssl/cert.pem .
