@@ -31,6 +31,7 @@ import random
 import re
 import select
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -355,6 +356,12 @@ def main(argv):
   if len(argv) < 2 or argv[1] == '--help':
     print get_doc()
     sys.exit(0)
+  if (not os.environ.get('PYTHONHTTPSVERIFY', '') and
+      getattr(ssl, '_create_unverified_context', None)):
+    # Prevent staticpython from trying to load /usr/local/ssl/cert.pem .
+    # `export PYTHONHTTPSVERIFY=1' would also work from the shell.
+    ssl._create_default_https_context = ssl._create_unverified_context
+    pass
   mega = Mega()
   had_error = False
   for url in argv[1:]:
