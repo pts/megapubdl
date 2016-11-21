@@ -11,7 +11,8 @@ exec python -- ${1+"$@"}; exit 1
 
 megapubdl is command-line tool for Unix implemented as a Python script to
 download public files (with a public URL) from MEGA (mega.nz, mega.co.nz).
-Works with Python 2.6 and 2.7, and needs only the `openssl' external tool.
+Works with Python 2.6 and 2.7, and needs only the `openssl' external tool or
+PyCrypto installed.
 
 Usage:
 
@@ -50,24 +51,219 @@ class RequestError(ValueError):
   """Error in API request."""
 
 
-def aes_cbc(is_encrypt, data, key):
-  if len(key) != 16:
-    raise ValueError
-  encdec = ('-d', '-e')[bool(is_encrypt)]
-  p = subprocess.Popen(
-      ('openssl', 'enc', encdec, '-aes-128-cbc', '-nopad', '-K', key.encode('hex'), '-iv', '0' * 32),
-      stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def import_get(module, name, default):
   try:
-    got, _ = p.communicate(data)
-  finally:
-    p.stdin.close()
-    exitcode = p.wait()
-  if exitcode:
-    raise ValueError('Error running openssl enc.')
-  if len(got) != len(data):
-    raise ValueError('openssl enc output size mismatch.')
-  assert len(got) == len(data)
-  return got
+    __import__(module)
+  except ImportError:
+    return default
+  return getattr(__import__('sys').modules[module], name, default)
+
+
+openssl_prog = False
+
+
+# Don't use this, alo-aes doesn't have AES-CTR, so we'd have to use openssl
+# anyway.
+if 0:
+  def aes_cbc(is_encrypt, data, key, iv='\0' * 16):
+    if len(key) != 16:
+      raise ValueError
+    if len(iv) != 16:
+      raise ValueError
+    # https://pypi.python.org/pypi/alo-aes/0.3 , implemented in C.
+    import aes
+    aes_obj = aes.Keysetup(key)
+    if is_encrypt:
+      return aes_obj.cbcencrypt(iv, data)[1]
+    else:
+      return aes_obj.cbcdecrypt(iv, data)[1]
+elif import_get('Crypto.Cipher.AES', 'MODE_CBC', None) is not None:
+  # PyCrypto, implemented in C (no Python implementation). Tested and found
+  # working with pycrypto-2.3.
+  def aes_cbc(is_encrypt, data, key, iv='\0' * 16):
+    if len(key) != 16:
+      raise ValueError
+    if len(iv) != 16:
+      raise ValueError
+    from Crypto.Cipher import AES
+    aes_obj = AES.new(key, AES.MODE_CBC, iv)
+    if is_encrypt:
+      return aes_obj.encrypt(data)
+    else:
+      return aes_obj.decrypt(data)
+else:
+  openssl_prog = True
+  def aes_cbc(is_encrypt, data, key, iv='\0' * 16):
+    if len(key) != 16:
+      raise ValueError
+    if len(iv) != 16:
+      raise ValueError
+    encdec = ('-d', '-e')[bool(is_encrypt)]
+    p = subprocess.Popen(
+        (openssl_prog, 'enc', encdec, '-aes-128-cbc', '-nopad',
+         '-K', key.encode('hex'), '-iv', iv.encode('hex')),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+      got, _ = p.communicate(data)
+    finally:
+      p.stdin.close()
+      exitcode = p.wait()
+    if exitcode:
+      raise ValueError('Error running openssl enc.')
+    if len(got) != len(data):
+      raise ValueError('openssl enc output size mismatch.')
+    assert len(got) == len(data)
+    return got
+
+
+def test_crypto_aes_cbc():
+  key = 'k' * 16
+  plaintext = 'a' * 64
+  ciphertext = 'c8a97171fe2841736c27863f5da199d199bd3d757aacf7da7dd1805dcf2bb652e638f58d25420ab367966acdde3c8a1a9994b7e7fd32ed91bf0ea646fdd874a3'.decode('hex')
+  assert aes_cbc(True,  plaintext, key) == ciphertext
+  assert aes_cbc(False, ciphertext, key) == plaintext
+
+
+if import_get('Crypto.Cipher.AES', 'MODE_CTR', None) is not None:
+  # PyCrypto, implemented in C (no Python implementation). Tested and found
+  # working with pycrypto-2.3.
+  def yield_aes_ctr(data_iter, key, iv='\0' * 16, bufsize=None):
+    if len(key) != 16:
+      raise ValueError
+    if len(iv) != 16:
+      raise ValueError
+    if isinstance(data_iter, str):
+      data_iter = (data_iter,)
+    data_iter = iter(data_iter)
+    # PyCrypto, implemented in C (no Python implementation).
+    from Crypto.Cipher import AES
+    from Crypto.Util import Counter
+    counter = Counter.new(8 * len(key), initial_value=int(iv.encode('hex'), 16))
+    aes_obj = AES.new(key, AES.MODE_CTR, counter=counter)
+    yield ''  # This is important, it signifies that decryption has started.
+    encrypt = aes_obj.encrypt  # .encrypt and .decrypt do the same.
+    for data in data_iter:
+      yield encrypt(data)
+else:
+  openssl_prog = True
+  def yield_aes_ctr(data_iter, key, iv='\0' * 16, bufsize=65536):
+    if len(key) != 16:
+      raise ValueError
+    if len(iv) != 16:
+      raise ValueError
+    if isinstance(data_iter, str):
+      data_iter = (data_iter,)
+    data_iter = iter(data_iter)
+    # Ubuntu Lucid has openssl-0.9.8k (2009-03-15) and openssl-0.9.8zh (2016)
+    # don't have -aes-128-ctr.
+    p = subprocess.Popen(
+        (openssl_prog, 'enc', '-d', '-aes-128-ctr', '-nopad',
+         '-K', key.encode('hex'), '-iv', iv.encode('hex')),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    wfd = p.stdin.fileno()
+    rfd = p.stdout.fileno()
+    file_size = read_size = write_size = 0
+    go = True
+    # We don't do MAC verification on the downloaded data, that would
+    # need additional crypto operations.
+    try:
+      yield ''  # This is important, it signifies that decryption has started.
+      assert wfd >= 0
+      while go:
+        data = ''
+        for data in data_iter:
+          file_size += len(data)
+          break  # Just get one (next) string.
+        if not data:
+          p.stdin.close()  # os.close(wfd)
+          wfd = -1
+          while 1:
+            pdata = os.read(rfd, bufsize)
+            if not pdata:
+              go = False
+              break
+            read_size += len(pdata)
+            yield pdata
+          break
+        i = 0
+        while i < len(data):
+          rfds, wfds, _ = select.select((rfd,), (wfd,), (), None)
+          if rfds:
+            pdata = os.read(rfd, bufsize)
+            if not pdata:
+              go = False
+              break
+            read_size += len(pdata)
+            yield pdata
+          if wfds:
+            got = os.write(wfd, buffer(data, i, i + bufsize))
+            i += got
+            write_size += got
+    finally:
+      exitcode = p.wait()
+    if exitcode:
+      raise ValueError('Error running openssl enc.')
+    if read_size != write_size:
+      raise ValueError('openssl enc output size mismatch: read_size=%d write_size=%d' % (read_size, write_size))
+    if read_size != file_size:
+      raise ValueError('File size mismatch.')
+
+
+def test_crypto_aes_ctr():
+  key = 'k' * 16
+  plaintext = 'a' * 63  # Not divisible by 16.
+  # With default iv: ciphertext = 'f442c33f3a194b34800aa6c6a1387a1e51a61c628a5d9cf4dfc404a5853bbdb2a35e5ffa6454a3f994189ecba05b4d106c80c5976b9b0d5825988eff547d15'.decode('hex')
+  ciphertext = '98ebbfa0932e0c3cf867b2ab5a7cd191a4d207475ec0340b49782d2e1083955c5838cf0b84ee87cf4b95a9b94b7e8f29de835be1ad0d7d078d505fb9bec167'.decode('hex')
+  iv = '\0\1\2\3' * 4
+  #assert aes_ctr(plaintext, key, iv) == ciphertext
+  #assert aes_ctr(ciphertext, key, iv) == plaintext
+  assert ''.join(yield_aes_ctr(plaintext, key, iv)) == ciphertext
+  assert ''.join(yield_aes_ctr(ciphertext, key, iv)) == plaintext
+  assert ''.join(yield_aes_ctr('foo\n', '\0' * 16)) == '\x00\x86\x24\xde'
+  # Does the encryption 1 byte at a time.
+  assert ''.join(yield_aes_ctr(iter('foo\n'), '\0' * 16)) == '\x00\x86\x24\xde'
+
+
+def check_aes_128_ctr():
+  # Ubuntu Lucid has openssl-0.9.8k (2009-03-15), which doesn't have
+  # -aes-128-ctr.
+  try:
+    data = ''.join(yield_aes_ctr('foo\n', '\0' * 16))
+  except (OSError, IOError, ValueError):
+    raise ValueError(
+        'Error starting crypto -- '
+        'you may need to upgrade your openssl command or install pycrypto.')
+  if data != '\x00\x86\x24\xde':
+    raise ValueError(
+        'Incorrect result from crypto -- '
+        'you may need to reinstall your openssl command or install pycrypto.')
+
+
+def find_custom_openssl():
+  global openssl_prog
+  if openssl_prog is not True:
+    return
+  import os
+  import os.path
+  prog = __file__
+  try:
+    target = os.readlink(prog)
+  except (OSError, AttributeError):
+    target = None
+  if target is not None:
+    if not target.startswith('/'):
+      prog = os.path.join(os.path.dirname(prog), target)
+  progdir = os.path.dirname(prog)
+  if not progdir:
+    progdir = '.'
+  for name in ('openssl-megapubdl',
+               'openssl-core2.static', 'openssl.static', 'openssl'):
+    pathname = os.path.join(progdir, name)
+    if os.path.isfile(pathname):
+      openssl_prog = pathname
+      break
+  else:
+    openssl_prog = 'openssl'
 
 
 def aes_cbc_encrypt_a32(data, key):
@@ -76,30 +272,6 @@ def aes_cbc_encrypt_a32(data, key):
 
 def aes_cbc_decrypt_a32(data, key):
   return str_to_a32(aes_cbc(False, a32_to_str(data), a32_to_str(key)))
-
-
-def check_aes_128_ctr():
-  # Ubuntu Lucid has openssl-0.9.8k (2009-03-15), which doesn't have
-  # -aes-128-ctr.
-  try:
-    p = subprocess.Popen(
-        ('openssl', 'enc', '-d', '-aes-128-ctr', '-nopad', '-K', '0', '-iv', '0'),
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-  except OSError:
-    raise RuntimeError('You need the openssl command.')
-  try:
-    data, _ = p.communicate('foo\n')
-  finally:
-    p.stdin.close()
-    exitcode = p.wait()
-  if exitcode:
-    raise ValueError(
-        'Error running `openssl enc -aes-128-ctr\' -- '
-        'you may need to upgrade your openssl command.')
-  if data != '\x00\x86\x24\xde':
-    raise ValueError(
-        'Incorrect result from \`openssl enc -aes-128-ctr\' -- '
-        'you may need to reinstall your openssl command.')
 
 
 def stringhash(str, aeskey):
@@ -187,7 +359,7 @@ def send_http_request(url, data=None, timeout=None):
   path = url[match.end():] or '/'
   ipaddr = socket.gethostbyname(host)  # Force IPv4. Needed by Mega.
   hc_cls = (httplib.HTTPConnection, httplib.HTTPSConnection)[schema == 'https']
-  # TODO(pts): Call hc.close() eventually.
+  # TODO(pts): Cleanup: Call hc.close() eventually.
   hc = hc_cls(ipaddr, port, timeout=timeout)
   if data is None:
     hc.request('GET', path)
@@ -312,55 +484,15 @@ class Mega(object):
     ct = hr.getheader('content-type', '').lower()
     if ct.startswith('text/'):  # Typically 'application/octet-stream'.
       raise RequestError('Unexpected content-type: %s' % ct)
-
-    p = subprocess.Popen(
-        ('openssl', 'enc', '-d', '-aes-128-ctr', '-nopad', '-K', key_str.encode('hex'), '-iv', iv_str.encode('hex')),
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    bufsize = self.bufsize
-    wfd = p.stdin.fileno()
-    rfd = p.stdout.fileno()
-    read_size = write_size = 0
-    go = True
-    # We don't do MAC verification on the downloaded data, that would
-    # need additional crypto operations.
-    try:
-      yield ''
-      assert wfd >= 0
-      while go:
-        data = hr.read(bufsize)
-        if not data:
-          p.stdin.close()  # os.close(wfd)
-          wfd = -1
-          while 1:
-            pdata = os.read(rfd, bufsize)
-            if not pdata:
-              go = False
-              break
-            read_size += len(pdata)
-            yield pdata
-          break
-        i = 0
-        while i < len(data):
-          rfds, wfds, _ = select.select((rfd,), (wfd,), (), None)
-          if rfds:
-            pdata = os.read(rfd, bufsize)
-            if not pdata:
-              go = False
-              break
-            read_size += len(pdata)
-            yield pdata
-          if wfds:
-            got = os.write(wfd, buffer(data, i, i + bufsize))
-            i += got
-            write_size += got
-    finally:
-      exitcode = p.wait()
-    if exitcode:
-      raise ValueError('Error running openssl enc.')
-    if read_size != write_size:
-      raise ValueError('openssl enc output size mismatch: read_size=%d write_size=%d' % (read_size, write_size))
-    if read_size != file_size:
-      raise ValueError('File size mismatch.')
+    yield_size = 0
+    for pdata in yield_aes_ctr(
+        iter(lambda bufsize=self.bufsize: hr.read(bufsize), ''),
+        key_str, iv_str, self.bufsize):
+      yield pdata
+      yield_size += len(pdata)
+    if yield_size != file_size:
+      raise RequestError('File size mismatch: got=%d expected=%d' %
+                         (yield_size, file_size))
 
 
 def get_module_docstring():
@@ -380,7 +512,13 @@ def main(argv):
   if len(argv) < 2 or argv[1] == '--help':
     print get_doc()
     sys.exit(0)
+  find_custom_openssl()
   check_aes_128_ctr()
+  if len(argv) > 1 and argv[1] == '--test-crypto':
+    test_crypto_aes_cbc()
+    test_crypto_aes_ctr()
+    print '%s --test-crypto OK.' % argv[0]
+    return
   if (not os.environ.get('PYTHONHTTPSVERIFY', '') and
       getattr(ssl, '_create_unverified_context', None)):
     # Prevent staticpython from trying to load /usr/local/ssl/cert.pem .
@@ -395,7 +533,8 @@ def main(argv):
       dl = mega.download_url(url)
       dl_info = dl.next()
       print >>sys.stderr, 'info: Saving file of %s bytes to file: %s' % (dl_info['size'], dl_info['name'])
-      dl.next()  # Start the download.
+      marker = dl.next()  # Start the download.
+      assert marker == ''
       f = open(dl_info['name'], 'wb')
       try:
         for data in dl:
