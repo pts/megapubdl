@@ -11,9 +11,13 @@ https://github.com/richardasaurus/mega.py/blob/master/mega/mega.py
 
 Differences from mega.py:
 
-* megapubdl doesn't have `requests' and `pycrypto' as a dependency.
-* megapubdl depends on the `openssl' external tool.
+* megapubdl is a single .py file (with no .py library dependencies).
+* megapubdl doesn't have `requests' as a dependency.
+* megapubdl works with either `pycrypto' or the `openssl' external tool,
+  while mega.py depends on the former.
 * megapubdl needs a Unix system to run. (Porting to Windows is possible.)
 * megapubdl supports only 1 use case: downloading public files.
+* megapubdl works with older versions of Python: 2.4, 2.5, 2.6 and 2.7.
+* megapubdl works with older versions of libssl.
 
 __END__
