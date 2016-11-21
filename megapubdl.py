@@ -11,8 +11,10 @@ exec python -- ${1+"$@"}; exit 1
 
 megapubdl is command-line tool for Unix implemented as a Python script to
 download public files (with a public URL) from MEGA (mega.nz, mega.co.nz).
-Works with Python 2.6 and 2.7, and needs only the `openssl' external tool or
-PyCrypto installed. It doesn't work with Python 3.x. It works with Python 2.4
+It works with Python 2.6 and 2.7, and needs only the `openssl' external tool or
+PyCrypto installed.
+
+megapubdl doesn't work with Python 3.x. It works with Python 2.4
 and 2.5 if the ssl module (https://pypi.python.org/pypi/ssl) is installed.
 
 Usage:
