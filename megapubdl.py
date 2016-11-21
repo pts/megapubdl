@@ -12,7 +12,8 @@ exec python -- ${1+"$@"}; exit 1
 megapubdl is command-line tool for Unix implemented as a Python script to
 download public files (with a public URL) from MEGA (mega.nz, mega.co.nz).
 Works with Python 2.6 and 2.7, and needs only the `openssl' external tool or
-PyCrypto installed.
+PyCrypto installed. It doesn't work with Python 3.x. It works with Python 2.5
+if the ssl module (https://pypi.python.org/pypi/ssl) is installed.
 
 Usage:
 
@@ -26,7 +27,6 @@ Usage:
 import base64
 import urllib  # For urlencode.
 import httplib
-import json  # Needs Python >=2.6.
 import os
 import random
 import re
@@ -37,6 +37,179 @@ import struct
 import subprocess
 import sys
 import traceback
+
+
+def import_get(module, name, default):
+  try:
+    __import__(module)
+  except ImportError:
+    return default
+  return getattr(__import__('sys').modules[module], name, default)
+
+
+# --- JSON parser and dumper (to stand in for `import json' in older Pythons).
+
+# Tis a bit more permissive (in the number syntax) than the grammar on
+# http://json.org/ . This also merges multiple operator tokens (without a
+# space) to one.
+JSON_TOKEN_RE = re.compile(
+    r'(\s+)|'  # Whitespace.
+    r'("([^\\"]+|\\(?:["\\/bfnrt]|u[0-9a-f]{4}))*")|'  # String literal.
+    r'(true|false|null)|'  # Named values.
+    r'[{}\[\],:]+|'  # Operators.
+    r'[-+]?(?:\d+(?:[.]\d*)?|[.]\d+)(?:[eE][-+]?\d+)?')  # Number literal.
+
+JSON_NAMED_VALUES = {'true': 'True', 'false': 'False', 'null': 'None'}
+
+JSON_STRING_PART_RE = re.compile(r'[^\\]+|\\(?:["\\/bfnrt]|u[0-9a-f]{4})')
+
+try:
+  import json as builtin_json  # From Python 2.6.
+except ImportError:
+  builtin_json = None
+
+try:
+  import ast as builtin_ast  # From Python 2.6.
+except ImportError:
+  builtin_ast = None
+
+
+def parse_json(data):
+  """Combination of json.loads and unicode_to_str. Works in Python >=2.4."""
+
+  if not isinstance(data, str):
+    raise TypeError
+
+  def unicode_to_str(obj, encoding='utf-8'):
+    if isinstance(obj, (list, tuple)):
+      return type(obj)(unicode_to_str(v, encoding) for v in obj)
+    elif isinstance(obj, dict):
+      return type(obj)((unicode_to_str(k, encoding), unicode_to_str(v, encoding))
+                       for k, v in obj.iteritems())
+    elif isinstance(obj, unicode):
+      return obj.encode(encoding)
+    else:
+      return obj
+
+  # Verified manually that custom_parse_json is the same as json.loads (from
+  # Python 2.6).
+  def custom_parse_json(data):
+    output = []
+    i = 0
+    while i < len(data):
+      match = JSON_TOKEN_RE.match(data, i)
+      if not match:
+        raise ValueError('JSON syntax error: %r' % (data[i : i + 16]))
+      i = match.end()
+      if match.group(1):  # Whitespace.
+        pass
+      elif match.group(2):  # String literal.
+        output.append('u')
+        if '\\/' not in match.group(2):
+          output.append(match.group(2))  # Fortunately same as Python syntax.
+        else:
+          for match2 in JSON_STRING_PART_RE.finditer(match.group(2)):
+            if match2.group() == '\\/':
+              output.append('/')
+            else:
+              output.append(match2.group())
+      elif match.group(3):
+        output.append(JSON_NAMED_VALUES[match.group(3)])
+      else:
+        # Fortunately punctuation and number literals are also the same as
+        # Python syntax.
+        output.append(match.group())
+    data = ''.join(output)
+    if builtin_ast:
+      return builtin_ast.literal_eval(data)
+    else:
+      # This is still safe because of the regexp scanning above.
+      return eval(data, {})
+
+  if builtin_json:
+    try:
+      return unicode_to_str(builtin_json.loads(data))  # Faster.
+    except Exception, e:  # Not KeyboardInterrupt.
+      raise ValueError('Error parsing JSON.')
+  else:
+    return unicode_to_str(custom_parse_json(data))
+
+
+JSON_STRING_ESCAPE_RE = re.compile(
+    r'[\xC0-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|'
+    r'[\x00-\x1F"\\\x7F-\xFF]')
+
+
+def dump_json(obj):
+  if builtin_json:
+    return builtin_json.dumps(obj)
+
+  output = []
+  emit = output.append
+
+  def escape_utf8(data):
+    if len(data) > 1:
+      try:
+        data = ord(data.decode('utf-8'))
+        if data > 0xffff:
+          data = '?'  # TODO(pts): Support surrogates.
+        else:
+          data = '\\u%04x' % data
+      except UnicdodDecodeError:
+        data = '?'
+    else:
+      data = '\\u%04x' % ord(data)
+    # TODO(pts): Generate short \" \\ \/ \b \f \n \r \t .
+    return data
+
+  def add(obj):
+    if obj is None:
+      emit('null')
+    elif obj is True:
+      emit('true')
+    elif obj is False:
+      emit('false')
+    elif isinstance(obj, (int, long)):
+      emit(str(obj))
+    elif isinstance(obj, float):
+      emit(repr(obj))  # TODO(pts): Does JSON support NaN etc.?
+    elif isinstance(obj, (str, unicode)):
+      if isinstance(obj, unicode):
+        obj = obj.encode('UTF-8')
+      emit('"')
+      emit(JSON_STRING_ESCAPE_RE.sub(
+          lambda match: escape_utf8(match.group()), obj))
+      emit('"')
+    elif isinstance(obj, (list, tuple)):
+      emit('[')
+      sep = ''
+      for item in obj:
+        if sep:
+          emit(sep)
+        sep = ','
+        add(item)
+      emit(']')
+    elif isinstance(obj, dict):
+      emit('{')
+      sep = ''
+      for key, value in sorted(obj.iteritems()):
+        if sep:
+          emit(sep)
+        sep = ','
+        add(str(key))
+        emit(':')
+        add(value)
+      emit('}')
+
+  add(obj)
+  return ''.join(output)
+
+
+assert dump_json([7, 77L, -6.5, True, False, None, "foo\"\\bar", unichr(0x15a) + '\0', [], {}, {33: [44]}]) in (
+    '[7, 77, -6.5, true, false, null, "foo\\"\\\\bar", "\\u015a\\u0000", [], {}, {"33": [44]}]',
+    '[7,77,-6.5,true,false,null,"foo\\u0022\\u005cbar","\\u015a\\u0000",[],{},{"33":[44]}]')
+
+# ---
 
 # This solves the HTTP connection problem on Ubuntu Lucid (10.04), but openssl
 # there is still too old: openssl: unknown option '-aes-128-ctr'
@@ -50,13 +223,7 @@ import traceback
 class RequestError(ValueError):
   """Error in API request."""
 
-
-def import_get(module, name, default):
-  try:
-    __import__(module)
-  except ImportError:
-    return default
-  return getattr(__import__('sys').modules[module], name, default)
+# ---
 
 
 openssl_prog = False
@@ -298,7 +465,7 @@ def decrypt_key(a, key):
 
 def decrypt_attr(attr, key):
   attr = aes_cbc(False, attr, a32_to_str(key)).rstrip('\0')
-  return json.loads(attr[4:]) if attr[:6] == 'MEGA{"' else False
+  return parse_json(attr[4:]) if attr[:6] == 'MEGA{"' else False
 
 
 def a32_to_str(a):
@@ -360,7 +527,10 @@ def send_http_request(url, data=None, timeout=None):
   ipaddr = socket.gethostbyname(host)  # Force IPv4. Needed by Mega.
   hc_cls = (httplib.HTTPConnection, httplib.HTTPSConnection)[schema == 'https']
   # TODO(pts): Cleanup: Call hc.close() eventually.
-  hc = hc_cls(ipaddr, port, timeout=timeout)
+  if sys.version_info < (2, 6):  # Python 2.5 doesn't support timeout.
+    hc = hc_cls(ipaddr, port)
+  else:
+    hc = hc_cls(ipaddr, port, timeout=timeout)
   if data is None:
     hc.request('GET', path)
   else:
@@ -420,10 +590,10 @@ class Mega(object):
       data = [data]
 
     url = '%s://g.api.%s/cs?%s' % (self.schema, self.domain, urllib.urlencode(params))
-    hr = send_http_request(url, data=json.dumps(data), timeout=self.timeout)
+    hr = send_http_request(url, data=dump_json(data), timeout=self.timeout)
     if hr.status != 200:
       raise RequestError('HTTP not OK: %s %s' % (hr.status, hr.reason))
-    json_resp = json.loads(hr.read())
+    json_resp = parse_json(hr.read())
     #if numeric error code response
     if isinstance(json_resp, int):
       raise RequestError(json_resp)
