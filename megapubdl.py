@@ -32,7 +32,6 @@ import random
 import re
 import select
 import socket
-import ssl
 import struct
 import subprocess
 import sys
@@ -209,22 +208,31 @@ assert dump_json([7, 77L, -6.5, True, False, None, "foo\"\\bar", unichr(0x15a) +
     '[7, 77, -6.5, true, false, null, "foo\\"\\\\bar", "\\u015a\\u0000", [], {}, {"33": [44]}]',
     '[7,77,-6.5,true,false,null,"foo\\u0022\\u005cbar","\\u015a\\u0000",[],{},{"33":[44]}]')
 
-# ---
+# --- SSL fixes.
 
-# This solves the HTTP connection problem on Ubuntu Lucid (10.04), but openssl
-# there is still too old: openssl: unknown option '-aes-128-ctr'
-#import ssl
-#from functools import partial
-#class fake_ssl:
-#  wrap_socket = partial(ssl.wrap_socket, ssl_version=ssl.PROTOCOL_TLSv1)  # Good.
-#httplib.ssl = fake_ssl
+def fix_ssl():
+  # This solves the HTTP connection problem on Ubuntu Lucid (10.04):
+  #   SSLError: [Errno 1] _ssl.c:480: error:140770FC:SSL routines:SSL23_GET_SERVER_HELLO:unknown protocol
+  # It also fixes the following problem with StaticPython ob some systems:
+  #   SSLError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed (_ssl.c:590)
+  #
+  # This fix works with Python version 2.4--2.7, with the bundled and the new
+  # (1.16) ssl module.
+  class fake_ssl:
+    import ssl  # Needed, the MEGA API is https:// only.
+    def partial(func, *args, **kwds):  # Emulate functools.partial for 2.4.
+      return lambda *fargs, **fkwds: func(*(args+fargs), **dict(kwds, **fkwds))
+    wrap_socket = staticmethod(partial(
+        ssl.wrap_socket, ssl_version=ssl.PROTOCOL_TLSv1))
+    # Prevent staticpython from trying to load /usr/local/ssl/cert.pem .
+    # `export PYTHONHTTPSVERIFY=1' would also work from the shell.
+    if getattr(ssl, '_create_unverified_context', None):
+      _create_default_https_context = staticmethod(
+          ssl._create_unverified_context)
+    del ssl, partial
+  httplib.ssl = fake_ssl
 
-
-class RequestError(ValueError):
-  """Error in API request."""
-
-# ---
-
+# --- Crypto.
 
 openssl_prog = False
 
@@ -435,6 +443,9 @@ def find_custom_openssl():
     openssl_prog = 'openssl'
 
 
+# ---
+
+
 def aes_cbc_encrypt_a32(data, key):
   return str_to_a32(aes_cbc(True, a32_to_str(data), a32_to_str(key)))
 
@@ -538,6 +549,10 @@ def send_http_request(url, data=None, timeout=None):
   else:
     hc.request('POST', path, data)
   return hc.getresponse()  # HTTPResponse.
+
+
+class RequestError(ValueError):
+  """Error in API request."""
 
 
 class Mega(object):
@@ -685,18 +700,13 @@ def main(argv):
     print get_doc()
     sys.exit(0)
   find_custom_openssl()
+  fix_ssl()
   check_aes_128_ctr()
   if len(argv) > 1 and argv[1] == '--test-crypto':
     test_crypto_aes_cbc()
     test_crypto_aes_ctr()
     print '%s --test-crypto OK.' % argv[0]
     return
-  if (not os.environ.get('PYTHONHTTPSVERIFY', '') and
-      getattr(ssl, '_create_unverified_context', None)):
-    # Prevent staticpython from trying to load /usr/local/ssl/cert.pem .
-    # `export PYTHONHTTPSVERIFY=1' would also work from the shell.
-    ssl._create_default_https_context = ssl._create_unverified_context
-    pass
   mega = Mega()
   had_error = False
   for url in argv[1:]:
