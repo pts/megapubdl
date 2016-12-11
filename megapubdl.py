@@ -34,6 +34,7 @@ import random
 import re
 import select
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -618,6 +619,19 @@ class Mega(object):
       raise RequestError(json_resp)
     return json_resp[0]
 
+  @classmethod
+  def _parse_url(self, url):
+    """Returns (file_id, file_key."""
+    i = url.find('/#!')
+    if i < 0:
+      raise RequestError('Key missing from URL.')
+    path = url[i + 3:].split('!')
+    return path[:2]
+
+  @classmethod
+  def get_file_id(self, url):
+    return self._parse_url(url)[0]
+
   def download_url(self, url):
     """Starts downloading a file from Mega, based on URL.
 
@@ -637,14 +651,9 @@ class Mega(object):
     """
     if self.sid is None:
       self._login()
-    i = url.find('/#!')
-    if i < 0:
-      raise RequestError('Key missing from URL.')
-    path = url[i + 3:].split('!')
-    file_handle = path[0]
-    file_key = path[1]
+    file_id, file_key = self._parse_url(url)
     file_key = base64_to_a32(file_key)  # if is_public:
-    file_data = self._api_request({'a': 'g', 'g': 1, 'p': file_handle})
+    file_data = self._api_request({'a': 'g', 'g': 1, 'p': file_id})
     k = (file_key[0] ^ file_key[4], file_key[1] ^ file_key[5],
        file_key[2] ^ file_key[6], file_key[3] ^ file_key[7])
     iv = file_key[4:6] + (0, 0)
@@ -665,7 +674,7 @@ class Mega(object):
     iv_str = struct.pack('>LLLL', iv[0], iv[1], 0, 0)
     assert len(iv_str) == 16
 
-    yield {'name': file_name, 'size': file_size, 'url': file_url, 'key': key_str, 'iv': iv_str}
+    yield {'name': file_name, 'size': file_size, 'url': file_url, 'key': key_str, 'iv': iv_str, 'id': file_id}
 
     hr = send_http_request(file_url, timeout=self.timeout)
     if hr.status != 200:
@@ -697,6 +706,52 @@ def get_doc(doc=None):
   return doc
 
 
+def fix_ext(filename):
+  a, b = os.path.splitext(filename)
+  return a + b.lower()
+
+
+def download_mega_url(url, mega):
+  print >>sys.stderr, 'info: Downloading URL: %s' % url
+  file_id = mega.get_file_id(url)
+  prefix = 'mega_%s_' % file_id
+  entries = [e for e in os.listdir('.') if e.startswith(prefix) and not e.endswith('.tmpdl')]
+  if entries:
+    for entry in entries:
+      print >>sys.stderr, 'info: Already present, keeping %s bytes in file: %s' % (
+          os.stat(entry).st_size, entry)
+    return
+  dl = mega.download_url(url)
+  dl_info = dl.next()
+  filename = prefix + fix_ext('_'.join(dl_info['name'].split()))
+  try:
+    st = os.stat(filename)
+  except OSError, e:
+    st = None
+  if st and stat.S_ISREG(st.st_mode) and st.st_size == dl_info['size']:
+    print >>sys.stderr, 'info: Already downloaded, keeping %s bytes in file: %s' % (
+        dl_info['size'], filename)
+    return
+  print >>sys.stderr, 'info: Saving file of %s bytes to file: %s' % (dl_info['size'], filename)
+  marker = dl.next()  # Start the download.
+  assert marker == ''
+  filename_tmpdl = filename + '.tmpdl'
+  try:
+    f = open(filename_tmpdl, 'wb')
+    try:
+      for data in dl:
+        f.write(data)
+    finally:
+      f.close()
+    os.rename(filename_tmpdl, filename)
+    filename_tmpdl = ''  # Don't attempt to remove it.
+  finally:
+    if filename_tmpdl:
+      try:
+        os.remove(filename_tmpdl)
+      except OSError:
+        pass
+
 def main(argv):
   if len(argv) < 2 or argv[1] == '--help':
     print get_doc()
@@ -712,19 +767,8 @@ def main(argv):
   mega = Mega()
   had_error = False
   for url in argv[1:]:
-    print >>sys.stderr, 'info: Downloading URL: %s' % url
     try:
-      dl = mega.download_url(url)
-      dl_info = dl.next()
-      print >>sys.stderr, 'info: Saving file of %s bytes to file: %s' % (dl_info['size'], dl_info['name'])
-      marker = dl.next()  # Start the download.
-      assert marker == ''
-      f = open(dl_info['name'], 'wb')
-      try:
-        for data in dl:
-          f.write(data)
-      finally:
-        f.close()
+      download_mega_url(url, mega)
     except (socket.error, IOError, OSError, ValueError):
       traceback.print_exc()
       had_error = True
