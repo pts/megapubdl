@@ -554,6 +554,32 @@ def send_http_request(url, data=None, timeout=None):
   return hc.getresponse()  # HTTPResponse.
 
 
+MEGA_ERRORS = {
+    0: 'API_OK',  # Success
+    -1: 'API_EINTERNAL',  # An internal error has occurred. Please submit a bug report, detailing the exact circumstances in which this error occurred.
+    -2: 'API_EARGS',  # You have passed invalid arguments to this command.
+    -3: 'API_EAGAIN',  # (always at the request level): A temporary congestion or server malfunction prevented your request from being processed. No data was altered. Retry. Retries must be spaced with exponential backoff.
+    -4: 'API_ERATELIMIT',  # You have exceeded your command weight per time quota. Please wait a few seconds, then try again (this should never happen in sane real-life applications).
+    -5: 'API_EFAILED',  # The upload failed. Please restart it from scratch.
+    -6: 'API_ETOOMANY',  # Too many concurrent IP addresses are accessing this upload target URL.
+    -7: 'API_ERANGE',  # The upload file packet is out of range or not starting and ending on a chunk boundary.
+    -8: 'API_EEXPIRED',  # The upload target URL you are trying to access has expired. Please request a fresh one.
+    -9: 'API_EOENT',  # Object (typically, node or user) not found
+    -10: 'API_ECIRCULAR',  # Circular linkage attempted
+    -11: 'API_EACCESS',  # Access violation (e.g., trying to write to a read-only share)
+    -12: 'API_EEXIST',  # Trying to create an object that already exists
+    -13: 'API_EINCOMPLETE',  # Trying to access an incomplete resource
+    -14: 'API_EKEY',  # A decryption operation failed (never returned by the API)
+    -15: 'API_ESID',  # Invalid or expired user session, please relogin
+    -16: 'API_EBLOCKED',  # User blocked
+    -17: 'API_EOVERQUOTA',  # Request over quota
+    -18: 'API_ETEMPUNAVAIL',  # Resource temporarily not available, please try again later
+    -19: 'API_ETOOMANYCONNECTIONS',  # Too many connections on this resource
+    -20: 'API_EWRITE',  # Write failed
+    -21: 'API_EREAD',  # Read failed
+    -22: 'API_EAPPKEY',  # Invalid application key; request not processed
+}
+
 class RequestError(ValueError):
   """Error in API request."""
 
@@ -614,9 +640,10 @@ class Mega(object):
     if hr.status != 200:
       raise RequestError('HTTP not OK: %s %s' % (hr.status, hr.reason))
     json_resp = parse_json(hr.read())
-    #if numeric error code response
     if isinstance(json_resp, int):
-      raise RequestError(json_resp)
+      raise RequestError('%s (%s)' % (MEGA_ERRORS.get(json_resp), json_resp))
+    if isinstance(json_resp[0], int):
+      raise RequestError('%s (%s)' % (MEGA_ERRORS.get(json_resp[0]), json_resp[0]))
     return json_resp[0]
 
   @classmethod
@@ -722,7 +749,12 @@ def download_mega_url(url, mega):
           os.stat(entry).st_size, entry)
     return
   dl = mega.download_url(url)
-  dl_info = dl.next()
+  try:
+    dl_info = dl.next()
+  except RequestError, e:
+    if str(e).startswith('API_EOENT ('):  # File not found on MEGA.
+      open(prefix + 'not_found.err', 'wb').close()
+    raise
   filename = prefix + fix_ext('_'.join(dl_info['name'].split()))
   try:
     st = os.stat(filename)
