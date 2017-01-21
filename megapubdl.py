@@ -691,11 +691,11 @@ class Mega(object):
     # Strangely, files can come back later.
     if 'g' not in file_data:
       raise RequestError('File not accessible now.')
-    file_url = file_data['g'].encode('UTF-8')
+    file_url = file_data['g']  # Can be non-ASCII UTF-8.
     file_size = int(file_data['s'])  # Was already an int.
     attribs = base64_url_decode(file_data['at'])
     attribs = decrypt_attr(attribs, k)
-    file_name = attribs['n'].encode('UTF-8')
+    file_name = attribs['n']  # Can be non-ASCII UTF-8.
     key_str = a32_to_str(k)
     assert len(key_str) == 16
     iv_str = struct.pack('>LLLL', iv[0], iv[1], 0, 0)
